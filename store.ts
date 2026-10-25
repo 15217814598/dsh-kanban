@@ -122,7 +122,7 @@ function rowToTask(row: Record<string, unknown>): Task {
     dueDate: row.due_date == null ? undefined : String(row.due_date),
     order: Number(row.task_order ?? 0),
     sessionId: row.session_id == null ? undefined : String(row.session_id),
-    feishuRecordId: row.feishu_record_id == null ? undefined : String(row.feishu_record_id),
+    remoteRecordId: row.remote_record_id == null ? undefined : String(row.remote_record_id),
   }
 }
 
@@ -179,7 +179,7 @@ export class TaskStore {
       due_date    TEXT,
       task_order  INTEGER NOT NULL DEFAULT 0,
       session_id  TEXT,
-      feishu_record_id TEXT
+      remote_record_id TEXT
     ) STRICT;
     CREATE INDEX IF NOT EXISTS idx_tasks_status_order ON tasks (status, task_order);
     CREATE TABLE IF NOT EXISTS settings (
@@ -231,8 +231,8 @@ export class TaskStore {
         if (!columns.includes('session_id')) {
           this.db.exec('ALTER TABLE tasks ADD COLUMN session_id TEXT')
         }
-        if (!columns.includes('feishu_record_id')) {
-          this.db.exec('ALTER TABLE tasks ADD COLUMN feishu_record_id TEXT')
+        if (!columns.includes('remote_record_id')) {
+          this.db.exec('ALTER TABLE tasks ADD COLUMN remote_record_id TEXT')
         }
       }
       this.db.exec(TaskStore.SCHEMA_SQL)
@@ -469,8 +469,8 @@ export class TaskStore {
   }
 
   /** Record the Feishu record id backing a locally created task (push dedup). */
-  attachFeishuRecord(taskId: string, recordId: string): void {
-    this.db.prepare('UPDATE tasks SET feishu_record_id = ? WHERE id = ?').run(recordId, taskId)
+  attachRemoteRecord(taskId: string, recordId: string): void {
+    this.db.prepare('UPDATE tasks SET remote_record_id = ? WHERE id = ?').run(recordId, taskId)
   }
 
   /** Delete a task */

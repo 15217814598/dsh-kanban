@@ -8,12 +8,19 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { FeishuClient } from './feishu.js'
-import type { FeishuConfig, ExecutionEvent } from './types.js'
+import { WeComClient } from './wecom.js'
+import type { FeishuConfig, WeComConfig, ExecutionEvent } from './types.js'
 import type { CreateTaskInput, UpdateTaskInput, MoveTaskInput, ApiResponse } from './types.js'
 import type { TaskEventEmitter } from './store.js'
 
 /** API base path */
 export const KANBAN_API_BASE = '/api/dsh-kanban'
+
+/** Both sync backends, resolved and owned by index.ts; config saves swap instances. */
+export interface SyncClientsRef {
+  feishu: FeishuClient | null
+  wecom: WeComClient | null
+}
 
 /**
  * Route definition for the DSH webServer service.
@@ -61,11 +68,6 @@ function isFeishuPlaceholder(cfg?: FeishuConfig): boolean {
     || cfg.appToken.startsWith('your-') || cfg.tableId.startsWith('your-')
 }
 
-/** Shared, mutable Feishu client holder (index.ts owns resolution; config saves swap it). */
-export interface FeishuClientRef {
-  current: FeishuClient | null
-}
-
 /** Create API routes */
 export function createKanbanRoutes(
   store: import('./store.js').TaskStore,
@@ -73,10 +75,23 @@ export function createKanbanRoutes(
   autoTaskStore?: import('./auto-task-store.js').AutoTaskStore,
   eventEmitter?: TaskEventEmitter,
   execTask?: (task: import('./types.js').Task) => { started: boolean; error?: string },
-  feishuRef?: FeishuClientRef,
+  syncRef?: SyncClientsRef,
 ): KanbanRoute[] {
-  // The Feishu client is resolved and owned by index.ts via feishuRef (shared
-  // with the auto-sync timers); config saves through these routes swap it.
+  // The sync clients are resolved and owned by index.ts via syncRef (shared
+  // with the auto-sync timers); config saves through these routes swap them.
+  // The active backend ('feishu' | 'wecom') lives in the settings table.
+
+  /** The backend sync-from/sync-to and push-back operate on. */
+  const activeBackend = (): 'feishu' | 'wecom' => {
+    try {
+      const raw = store.getSetting('sync-backend')
+      return JSON.parse(raw ?? '') === 'wecom' ? 'wecom' : 'feishu'
+    } catch {
+      return 'feishu'
+    }
+  }
+  const activeClient = (): FeishuClient | WeComClient | null =>
+    activeBackend() === 'wecom' ? syncRef?.wecom ?? null : syncRef?.feishu ?? null
 
   return [
     // ── /api/dsh-kanban/tasks (GET=list, POST=create) ──
@@ -309,7 +324,7 @@ export function createKanbanRoutes(
           return
         }
 
-        if (!feishuRef?.current) {
+        if (!syncRef?.feishu) {
           sendJson(res, 200, {
             success: true,
             data: { configured: false, message: '飞书未配置' },
@@ -383,7 +398,7 @@ export function createKanbanRoutes(
           }
 
           // 创建新的飞书客户端
-          if (feishuRef) feishuRef.current = new FeishuClient(normalized as FeishuConfig)
+          if (syncRef) syncRef.feishu = new FeishuClient(normalized as FeishuConfig)
 
           // 保存到 SQLite settings 表（重启后自动加载）
           store.setSetting('feishu', JSON.stringify(normalized))
@@ -411,7 +426,7 @@ export function createKanbanRoutes(
           return
         }
 
-        if (!feishuRef?.current) {
+        if (!syncRef?.feishu) {
           sendJson(res, 400, {
             success: false,
             error: '飞书未配置，请在 cordis.patch.yml 中配置飞书应用凭证',
@@ -420,7 +435,7 @@ export function createKanbanRoutes(
         }
 
         try {
-          const tasks = await feishuRef.current.syncFromFeishu()
+          const tasks = await syncRef.feishu.syncFromFeishu()
 
           for (const task of tasks) {
             const existing = store.getById(task.id)
@@ -456,7 +471,7 @@ export function createKanbanRoutes(
           return
         }
 
-        if (!feishuRef?.current) {
+        if (!syncRef?.feishu) {
           sendJson(res, 400, {
             success: false,
             error: '飞书未配置，请在 cordis.patch.yml 中配置飞书应用凭证',
@@ -474,7 +489,7 @@ export function createKanbanRoutes(
             ...allTasks.done,
           ]
 
-          await feishuRef.current.syncToFeishu(tasks, (taskId, recordId) => store.attachFeishuRecord(taskId, recordId))
+          await syncRef.feishu.syncToFeishu(tasks, (taskId, recordId) => store.attachRemoteRecord(taskId, recordId))
 
           sendJson(res, 200, {
             success: true,
@@ -485,6 +500,65 @@ export function createKanbanRoutes(
             success: false,
             error: `同步失败: ${error.message}`,
           })
+        }
+      },
+    },
+
+    // ── /api/dsh-kanban/wecom/config (GET=read config, POST=save config) ──
+    {
+      kind: 'exact',
+      path: `${KANBAN_API_BASE}/wecom/config`,
+      handler: async (req, res) => {
+        if (req.method === 'GET') {
+          try {
+            const savedRaw = store.getSetting('wecom')
+            const saved: WeComConfig | null = savedRaw ? JSON.parse(savedRaw) : null
+            sendJson(res, 200, {
+              success: true,
+              data: saved
+                ? {
+                    corpid: saved.corpid ?? '',
+                    corpsecret: saved.corpsecret ?? '',
+                    docid: saved.docid ?? '',
+                    sheetId: saved.sheetId ?? '',
+                    fieldMapping: saved.fieldMapping,
+                    autoSyncMinutes: saved.autoSyncMinutes ?? 0,
+                  }
+                : null,
+            })
+          } catch (error: any) {
+            sendJson(res, 500, { success: false, error: `读取配置失败: ${error.message}` })
+          }
+          return
+        }
+
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { success: false, error: 'method not allowed' })
+          return
+        }
+
+        try {
+          const config = await parseBody(req)
+          if (!config.corpid || !config.corpsecret || !config.docid) {
+            sendJson(res, 400, { success: false, error: '缺少必填字段（corpid / corpsecret / docid）' })
+            return
+          }
+
+          const normalized: WeComConfig = {
+            corpid: String(config.corpid).trim(),
+            corpsecret: String(config.corpsecret).trim(),
+            docid: String(config.docid).trim(),
+            sheetId: config.sheetId ? String(config.sheetId).trim() : undefined,
+            autoSyncMinutes: Math.max(0, Math.min(1440, parseInt(String(config.autoSyncMinutes ?? 0), 10) || 0)),
+            fieldMapping: config.fieldMapping,
+          }
+
+          if (syncRef) syncRef.wecom = new WeComClient(normalized)
+          store.setSetting('wecom', JSON.stringify(normalized))
+
+          sendJson(res, 200, { success: true, data: { message: '企业微信配置已保存' } })
+        } catch (error: any) {
+          sendJson(res, 500, { success: false, error: `保存配置失败: ${error.message}` })
         }
       },
     },
@@ -758,6 +832,104 @@ export function createKanbanRoutes(
           clearInterval(keepAlive)
           unsubscribe?.()
         })
+      },
+    },
+
+    // ── /api/dsh-kanban/sync-backend (GET=read, POST=switch active backend) ──
+    {
+      kind: 'exact' as const,
+      path: `${KANBAN_API_BASE}/sync-backend`,
+      handler: async (req, res) => {
+        const method = req.method ?? 'GET'
+        if (method === 'GET') {
+          sendJson(res, 200, { success: true, data: { backend: activeBackend() } })
+          return
+        }
+        if (method === 'POST') {
+          try {
+            const body = await parseBody(req)
+            if (body.backend !== 'feishu' && body.backend !== 'wecom') {
+              sendJson(res, 400, { success: false, error: "backend 必须是 'feishu' 或 'wecom'" })
+              return
+            }
+            store.setSetting('sync-backend', JSON.stringify(body.backend))
+            sendJson(res, 200, { success: true, data: { backend: body.backend } })
+          } catch (error: any) {
+            sendJson(res, 400, { success: false, error: error.message })
+          }
+          return
+        }
+        sendJson(res, 405, { success: false, error: `method not allowed: ${method}` })
+      },
+    },
+
+    // ── /api/dsh-kanban/sync/pull (POST — pull via the active backend) ──
+    {
+      kind: 'exact' as const,
+      path: `${KANBAN_API_BASE}/sync/pull`,
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { success: false, error: 'method not allowed' })
+          return
+        }
+        const backend = activeBackend()
+        const client = activeClient()
+        if (!client) {
+          sendJson(res, 400, { success: false, error: `${backend} 未配置` })
+          return
+        }
+        try {
+          const tasks = backend === 'wecom'
+            ? await (client as WeComClient).pullTasks()
+            : await (client as FeishuClient).syncFromFeishu()
+          for (const task of tasks) {
+            const existing = store.getById(task.id)
+            if (existing) {
+              // 更新已有任务不覆盖本地状态——状态流转以看板为准（完成时推回远端）
+              const { status: _status, ...fields } = task
+              store.update(task.id, fields)
+            } else {
+              store.create(task)
+            }
+          }
+          sendJson(res, 200, { success: true, data: { imported: tasks.length, message: `成功从${backend === 'wecom' ? '企业微信' : '飞书'}同步 ${tasks.length} 个任务` } })
+        } catch (error: any) {
+          sendJson(res, 500, { success: false, error: `同步失败: ${error.message}` })
+        }
+      },
+    },
+
+    // ── /api/dsh-kanban/sync/push (POST — push board tasks via the active backend) ──
+    {
+      kind: 'exact' as const,
+      path: `${KANBAN_API_BASE}/sync/push`,
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { success: false, error: 'method not allowed' })
+          return
+        }
+        const backend = activeBackend()
+        const client = activeClient()
+        if (!client) {
+          sendJson(res, 400, { success: false, error: `${backend} 未配置` })
+          return
+        }
+        try {
+          const all = store.getAll()
+          const tasks = [...all.planned, ...all.todo, ...all['in-progress'], ...all.review, ...all.done]
+          if (backend === 'wecom') {
+            const wecom = client as WeComClient
+            for (const task of tasks) {
+              const recordId = await wecom.pushTask(task)
+              store.attachRemoteRecord(task.id, recordId)
+            }
+          } else {
+            await (client as FeishuClient).syncToFeishu(tasks, (taskId, recordId) => store.attachRemoteRecord(taskId, recordId))
+          }
+          sendJson(res, 200, { success: true, data: { exported: tasks.length, message: `成功同步 ${tasks.length} 个任务到${backend === 'wecom' ? '企业微信' : '飞书'}` } })
+        } catch (error: any) {
+          sendJson(res, 500, { success: false, error: `同步失败: ${error.message}` })
+        }
       },
     },
   ]

@@ -12,7 +12,7 @@ import { NavHeader } from './NavHeader'
 import { KanbanColumn } from './KanbanColumn'
 import { TaskForm } from './TaskForm'
 import { ArchiveDialog } from './ArchiveDialog'
-import { FeishuDialog } from './FeishuDialog'
+import { SyncDialog } from './FeishuDialog'
 import { AutoTaskDialog } from './AutoTaskDialog'
 import { TaskFilterBar, applyFilters, type TaskFilters } from './TaskFilterBar'
 import { ExecutionLog } from './ExecutionLog'
@@ -407,7 +407,7 @@ export function KanbanBoard({ onClose }: KanbanBoardProps) {
         />
 
         {/* Feishu Sync Dialog */}
-        <FeishuDialog
+        <SyncDialog
           open={feishuOpen}
           onClose={() => setFeishuOpen(false)}
           onSyncComplete={loadTasks}

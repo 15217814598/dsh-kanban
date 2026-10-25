@@ -22,9 +22,10 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import { TaskStore } from './store.js'
 import { AutoTaskStore } from './auto-task-store.js'
 import { FeishuClient, type FeishuConfig } from './feishu.js'
-import { createKanbanRoutes, KANBAN_API_BASE, type FeishuClientRef } from './routes.js'
+import { WeComClient } from './wecom.js'
+import { createKanbanRoutes, KANBAN_API_BASE, type SyncClientsRef } from './routes.js'
 import { createKanbanTools } from './tools.js'
-import type { KanbanConfig, Task } from './types.js'
+import type { KanbanConfig, Task, WeComConfig } from './types.js'
 
 /** Stable cordis plugin name */
 export const name = 'kanban'
@@ -102,9 +103,9 @@ function applyImpl(ctx: Context, config?: KanbanConfig): void {
   const store = new TaskStore(resolvedConfig.maxTasks, resolvedConfig.dbPath)
   const autoTaskStore = new AutoTaskStore(store)
 
-  // Resolve the Feishu client once (SQLite-saved config wins over patch config);
+  // Resolve both sync clients once (SQLite-saved config wins over patch config);
   // the ref is shared with the routes (config saves swap it) and the sync timers.
-  const feishuRef: FeishuClientRef = { current: null }
+  const syncRef: SyncClientsRef = { feishu: null, wecom: null }
   try {
     const savedRaw = store.getSetting('feishu')
     const saved: FeishuConfig | null = savedRaw ? JSON.parse(savedRaw) : null
@@ -113,15 +114,24 @@ function applyImpl(ctx: Context, config?: KanbanConfig): void {
       || cfg.appId.startsWith('your-') || cfg.appSecret.startsWith('your-')
       || cfg.appToken.startsWith('your-') || cfg.tableId.startsWith('your-')
     if (saved && !isPlaceholder(saved)) {
-      feishuRef.current = new FeishuClient(saved)
+      syncRef.feishu = new FeishuClient(saved)
     } else if (!isPlaceholder(resolvedConfig.feishu)) {
-      feishuRef.current = new FeishuClient(resolvedConfig.feishu)
+      syncRef.feishu = new FeishuClient(resolvedConfig.feishu)
     }
   } catch (e) {
     console.error('[dsh-kanban] Failed to load feishu config from SQLite:', e)
   }
+  try {
+    const wecomRaw = store.getSetting('wecom')
+    const wecomSaved: WeComConfig | null = wecomRaw ? JSON.parse(wecomRaw) : null
+    if (wecomSaved?.corpid && wecomSaved?.corpsecret && wecomSaved?.docid) {
+      syncRef.wecom = new WeComClient(wecomSaved)
+    }
+  } catch (e) {
+    console.error('[dsh-kanban] Failed to load wecom config from SQLite:', e)
+  }
 
-  const kanbanRoutes = createKanbanRoutes(store, resolvedConfig.feishu, autoTaskStore, store.events, startTaskDelivery, feishuRef)
+  const kanbanRoutes = createKanbanRoutes(store, resolvedConfig.feishu, autoTaskStore, store.events, startTaskDelivery, syncRef)
 
   console.log(`[dsh-kanban] Initializing with ${store.count} existing tasks`)
 
@@ -318,13 +328,27 @@ function applyImpl(ctx: Context, config?: KanbanConfig): void {
     }
   }, 10_000)
 
-  // ── Feishu auto-sync ──
-  /** Pull Feishu records into the board (upsert by record id). Existing tasks
-   * keep their local status — status flows to Feishu via push-back instead. */
+  // ── Remote sync (Feishu / WeCom, whichever is active in settings) ──
+  const activeBackend = (): 'feishu' | 'wecom' => {
+    try {
+      const raw = store.getSetting('sync-backend')
+      return JSON.parse(raw ?? '') === 'wecom' ? 'wecom' : 'feishu'
+    } catch {
+      return 'feishu'
+    }
+  }
+  const activeClient = (): FeishuClient | WeComClient | null =>
+    activeBackend() === 'wecom' ? syncRef.wecom : syncRef.feishu
+
+  /** Pull remote records into the board (upsert by record id). Existing tasks
+   * keep their local status — status flows to the remote via push-back instead. */
   const pullNow = async (): Promise<number> => {
-    const client = feishuRef.current
+    const backend = activeBackend()
+    const client = activeClient()
     if (!client) return 0
-    const tasks = await client.syncFromFeishu()
+    const tasks = backend === 'wecom'
+      ? await (client as WeComClient).pullTasks()
+      : await (client as FeishuClient).syncFromFeishu()
     for (const task of tasks) {
       const existing = store.getById(task.id)
       if (existing) {
@@ -338,30 +362,39 @@ function applyImpl(ctx: Context, config?: KanbanConfig): void {
   }
 
   let lastPullAt = 0
-  // 60s master tick: pull when the configured autoSyncMinutes interval elapses
+  // 60s master tick: pull when the active backend's autoSyncMinutes interval elapses
   const feishuSweep = setInterval(() => {
-    if (disposed || !feishuRef.current) return
+    if (disposed) return
+    const backend = activeBackend()
+    const client = activeClient()
+    if (!client) return
     let minutes = 0
     try {
-      const raw = store.getSetting('feishu')
+      const raw = store.getSetting(backend)
       minutes = raw ? (JSON.parse(raw).autoSyncMinutes ?? 0) : 0
     } catch { return }
     if (minutes <= 0) return
     if (Date.now() - lastPullAt < minutes * 60_000) return
     lastPullAt = Date.now()
     pullNow()
-      .then(n => console.log(`[dsh-kanban] Feishu auto-pull: ${n} tasks`))
-      .catch(e => console.warn('[dsh-kanban] Feishu auto-pull failed:', (e as Error)?.message ?? e))
+      .then(n => console.log(`[dsh-kanban] ${backend} auto-pull: ${n} tasks`))
+      .catch(e => console.warn(`[dsh-kanban] ${backend} auto-pull failed:`, (e as Error)?.message ?? e))
   }, 60_000)
 
-  // Push back to Feishu when the AI finishes a task's work (status → 评审中)
+  // Push back to the remote when the AI finishes a task's work (status → 评审中)
   disposers.push(store.events.subscribe(evt => {
     if (evt.type !== 'task:completed' || disposed) return
     const task = store.getById(evt.taskId)
-    if (!task || !feishuRef.current) return
-    feishuRef.current.syncToFeishu([task], (taskId, recordId) => store.attachFeishuRecord(taskId, recordId))
-      .then(() => console.log(`[dsh-kanban] Feishu push-back ok: ${task.title}`))
-      .catch(e => console.warn(`[dsh-kanban] Feishu push-back failed for "${task.title}":`, (e as Error)?.message ?? e))
+    if (!task) return
+    const backend = activeBackend()
+    const client = activeClient()
+    if (!client) return
+    const push = backend === 'wecom'
+      ? (client as WeComClient).pushTask(task).then(recordId => store.attachRemoteRecord(task.id, recordId))
+      : (client as FeishuClient).syncToFeishu([task], (taskId, recordId) => store.attachRemoteRecord(taskId, recordId))
+    push
+      .then(() => console.log(`[dsh-kanban] ${backend} push-back ok: ${task.title}`))
+      .catch(e => console.warn(`[dsh-kanban] ${backend} push-back failed for "${task.title}":`, (e as Error)?.message ?? e))
   }))
 
   /**

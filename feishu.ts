@@ -443,12 +443,12 @@ export class FeishuClient {
   async syncToFeishu(tasks: Task[], onRecordMapped?: (taskId: string, recordId: string) => void): Promise<void> {
     for (const task of tasks) {
       const fields = this.taskToRecord(task)
-      const recordId = task.feishuRecordId || (task.id.startsWith('rec') ? task.id : undefined)
+      const recordId = task.remoteRecordId || (task.id.startsWith('rec') ? task.id : undefined)
 
       if (recordId) {
         // 已存在的飞书记录，更新
         await this.updateRecord(recordId, fields)
-        if (onRecordMapped && recordId !== task.feishuRecordId) onRecordMapped(task.id, recordId)
+        if (onRecordMapped && recordId !== task.remoteRecordId) onRecordMapped(task.id, recordId)
       } else {
         // 新记录，创建并回写映射
         const record = await this.createRecord(fields)

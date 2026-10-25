@@ -73,7 +73,7 @@ export function NavHeader({
       </button>
       <button className="kb-btn" onClick={onFeishu}>
         <IconCloud />
-        飞书
+        同步
       </button>
       <button className="kb-btn" onClick={onAutoTask}>
         <IconBolt />

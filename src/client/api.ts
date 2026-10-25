@@ -69,6 +69,17 @@ export interface FeishuConfig {
   autoSyncMinutes?: number
 }
 
+export interface WeComConfig {
+  corpid: string
+  corpsecret: string
+  docid: string
+  sheetId?: string
+  /** Auto-pull interval in minutes; 0/undefined = off. */
+  autoSyncMinutes?: number
+}
+
+export type SyncBackend = 'feishu' | 'wecom'
+
 export type AutoTaskDeliveryMode = 'new-session' | 'existing'
 
 export interface AutoTaskConfig {
@@ -226,6 +237,15 @@ export const kanbanApi = {
     })
   },
 
+  /** Pull/push via the ACTIVE sync backend (feishu or wecom). */
+  async syncPull(): Promise<{ message: string }> {
+    return request<{ message: string }>('/sync/pull', { method: 'POST' })
+  },
+
+  async syncPush(): Promise<{ message: string }> {
+    return request<{ message: string }>('/sync/push', { method: 'POST' })
+  },
+
   async feishuSyncTo(): Promise<{ message: string }> {
     return request<{ message: string }>('/feishu/sync-to', {
       method: 'POST',
@@ -263,6 +283,32 @@ export const kanbanApi = {
       tableId: data.tableId,
       autoSyncMinutes: data.autoSyncMinutes ?? 0,
     }
+  },
+
+  // WeCom (企业微信文档·智能表格) config + active sync backend
+  async wecomGetConfig(): Promise<WeComConfig | null> {
+    const data = await request<WeComConfig | null>('/wecom/config')
+    if (!data || !data.corpid) return null
+    return data
+  },
+
+  async wecomSaveConfig(config: WeComConfig): Promise<void> {
+    await request<{ message: string }>('/wecom/config', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  },
+
+  async getSyncBackend(): Promise<SyncBackend> {
+    const data = await request<{ backend: SyncBackend }>('/sync-backend')
+    return data.backend === 'wecom' ? 'wecom' : 'feishu'
+  },
+
+  async setSyncBackend(backend: SyncBackend): Promise<void> {
+    await request<{ backend: SyncBackend }>('/sync-backend', {
+      method: 'POST',
+      body: JSON.stringify({ backend }),
+    })
   },
 
   // Auto-task

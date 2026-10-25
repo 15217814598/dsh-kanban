@@ -20,8 +20,8 @@ export interface Task {
   project?: string
   /** Session that executed/witnessed this task (set on auto-task delivery). */
   sessionId?: string
-  /** Feishu bitable record id backing this task (set by sync/push-back). */
-  feishuRecordId?: string
+  /** Remote record id (Feishu bitable / WeCom smartsheet) backing this task. */
+  remoteRecordId?: string
   comments?: number
   attachments?: number
   createdAt: string
@@ -134,4 +134,26 @@ export interface ExecutionEvent {
 export interface SSEPayload {
   type: 'execution'
   event: ExecutionEvent
+}
+
+/** 企业微信文档「智能表格」同步配置 */
+export interface WeComConfig {
+  corpid: string
+  corpsecret: string
+  /** 智能表格所在文档的 docid */
+  docid: string
+  /** 子表 sheet_id；不填时自动使用文档的第一个子表 */
+  sheetId?: string
+  /** 自动拉取间隔（分钟），0 = 关闭 */
+  autoSyncMinutes?: number
+  fieldMapping?: {
+    title?: string
+    description?: string
+    status?: string
+    priority?: string
+    tags?: string
+    assignee?: string
+    dueDate?: string
+    project?: string
+  }
 }

@@ -2,7 +2,7 @@
 
 - insert:
     - id: kanban
-      name: 'dsh-kanban'
+      name: 'dsh-kanban-plugin'
       config:
         enabled: true
         maxTasks: 1000

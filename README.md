@@ -18,8 +18,14 @@ DeepSeek Harness Web GUI 的热插拔任务看板插件，提供任务管理、�
 ### 安装
 
 ```bash
+# Install from GitHub source (recommended)
+dsh plugin --profile web add github:15217814598/dsh-kanban
+
+# Or install from a local directory (dev mode)
 dsh plugin --profile web add link:/path/to/dsh-kanban
 ```
+
+> Requires DeepSeek Harness ≥ 0.2.1-rc.3 (uses sessionController delivery, session/event hooks and native tool registration).
 
 ### 使用方法
 
